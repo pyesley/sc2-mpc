@@ -57,9 +57,67 @@ class MicroState:
     time: float
 
 
-# ─── Simple Dynamics Model ───────────────────────────────────
-def predict_zealot_move(zealot_pos, m1_pos, m2_pos, dt):
-    """Zealot chases the closest marine."""
+# ─── Stochastic Dynamics Model ───────────────────────────────
+#
+# Sources of uncertainty modeled:
+#   1. Zealot target-switching: when distances are close, the zealot
+#      may chase either marine. Modeled as a Bernoulli draw whose
+#      probability depends on the distance gap.
+#   2. Zealot pursuit noise: angular perturbation on chase direction
+#      (models pathing, acceleration, AI tick rate).
+#   3. Marine execution noise: small position noise on move commands
+#      (models command latency and pathing).
+#
+ZEALOT_SWITCH_SHARPNESS = 3.0   # how sharply target prob depends on distance gap
+ZEALOT_PURSUIT_NOISE = 0.15     # std of angular noise on chase direction (radians)
+MARINE_EXEC_NOISE = 0.05        # std of position noise per move step
+
+
+def zealot_target_probability(d1, d2):
+    """Probability that zealot chases marine 1 (softmax over negative distances).
+
+    When d1 << d2, p ≈ 1 (chases m1). When d1 ≈ d2, p ≈ 0.5 (coin flip).
+    ZEALOT_SWITCH_SHARPNESS controls how sharp the transition is.
+    """
+    # Softmax: p(chase m1) = exp(-k*d1) / (exp(-k*d1) + exp(-k*d2))
+    # Numerically stable form:
+    gap = ZEALOT_SWITCH_SHARPNESS * (d2 - d1)
+    return 1.0 / (1.0 + np.exp(-gap))
+
+
+def predict_zealot_move_stochastic(zealot_pos, m1_pos, m2_pos, dt, rng):
+    """Stochastic zealot movement with target-switching uncertainty."""
+    d1 = np.linalg.norm(zealot_pos - m1_pos)
+    d2 = np.linalg.norm(zealot_pos - m2_pos)
+
+    # Stochastic target selection
+    p_chase_m1 = zealot_target_probability(d1, d2)
+    if rng.random() < p_chase_m1:
+        target = m1_pos
+    else:
+        target = m2_pos
+
+    direction = target - zealot_pos
+    dist = np.linalg.norm(direction)
+    if dist < 0.1:
+        return zealot_pos.copy()
+
+    direction = direction / dist
+
+    # Add angular noise to pursuit direction
+    angle_noise = rng.normal(0, ZEALOT_PURSUIT_NOISE)
+    cos_n, sin_n = np.cos(angle_noise), np.sin(angle_noise)
+    direction = np.array([
+        cos_n * direction[0] - sin_n * direction[1],
+        sin_n * direction[0] + cos_n * direction[1],
+    ])
+
+    move_dist = min(ZEALOT_SPEED * dt, dist)
+    return zealot_pos + direction * move_dist
+
+
+def predict_zealot_move_deterministic(zealot_pos, m1_pos, m2_pos, dt):
+    """Original deterministic model (zealot chases closest)."""
     d1 = np.linalg.norm(zealot_pos - m1_pos)
     d2 = np.linalg.norm(zealot_pos - m2_pos)
     target = m1_pos if d1 <= d2 else m2_pos
@@ -70,8 +128,8 @@ def predict_zealot_move(zealot_pos, m1_pos, m2_pos, dt):
     return zealot_pos + (direction / dist) * min(ZEALOT_SPEED * dt, dist)
 
 
-def simulate_trajectory(state, m1_actions, m2_actions, dt=0.5):
-    """Roll out trajectory for both marines. No role assumptions."""
+def simulate_trajectory(state, m1_actions, m2_actions, dt=0.5, rng=None):
+    """Roll out trajectory. If rng is provided, use stochastic dynamics."""
     trajectory = []
     m1_pos = state.m1_pos.copy()
     m2_pos = state.m2_pos.copy()
@@ -84,9 +142,15 @@ def simulate_trajectory(state, m1_actions, m2_actions, dt=0.5):
         m1_move = m1_actions[i]
         m2_move = m2_actions[i]
 
-        m1_pos = m1_pos + m1_move * MARINE_SPEED * dt
-        m2_pos = m2_pos + m2_move * MARINE_SPEED * dt
-        zealot_pos = predict_zealot_move(zealot_pos, m1_pos, m2_pos, dt)
+        # Marine movement with execution noise
+        if rng is not None:
+            m1_pos = m1_pos + m1_move * MARINE_SPEED * dt + rng.normal(0, MARINE_EXEC_NOISE, 2)
+            m2_pos = m2_pos + m2_move * MARINE_SPEED * dt + rng.normal(0, MARINE_EXEC_NOISE, 2)
+            zealot_pos = predict_zealot_move_stochastic(zealot_pos, m1_pos, m2_pos, dt, rng)
+        else:
+            m1_pos = m1_pos + m1_move * MARINE_SPEED * dt
+            m2_pos = m2_pos + m2_move * MARINE_SPEED * dt
+            zealot_pos = predict_zealot_move_deterministic(zealot_pos, m1_pos, m2_pos, dt)
 
         d1 = float(np.linalg.norm(zealot_pos - m1_pos))
         d2 = float(np.linalg.norm(zealot_pos - m2_pos))
@@ -200,32 +264,70 @@ def generate_candidate_actions(n_candidates, horizon, state):
     return candidates
 
 
-def mpc_select_action(state, n_candidates=128, horizon=8, dt=0.5):
-    """Run MPC: generate candidates, simulate, evaluate, pick best."""
+def evaluate_trajectory(trajectory):
+    """Evaluate cost over a trajectory, return (total_cost, components_dict)."""
+    total_cost = 0.0
+    all_components = {}
+    for sim_state in trajectory:
+        cost, components = compute_cost(sim_state)
+        total_cost += cost
+        for k, v in components.items():
+            all_components[k] = all_components.get(k, 0.0) + v
+    return total_cost, all_components
+
+
+def mpc_select_action(state, n_candidates=96, n_scenarios=8, horizon=8,
+                       dt=0.5, cvar_alpha=0.3):
+    """Stochastic MPC with CVaR risk measure.
+
+    For each candidate action sequence, simulates n_scenarios stochastic
+    futures (with zealot target-switching uncertainty, pursuit noise, and
+    execution noise). Evaluates cost on each scenario. Selects the candidate
+    whose CVaR (average of worst cvar_alpha fraction) is lowest.
+
+    This is robust to the failure mode where the zealot unexpectedly
+    switches targets: candidates that only work in one scenario score
+    poorly because the worst-case scenarios dominate.
+
+    Args:
+        n_candidates: number of action sequence candidates to sample
+        n_scenarios: stochastic rollouts per candidate
+        horizon: prediction steps
+        dt: time step per prediction step
+        cvar_alpha: CVaR tail fraction (0.3 = average of worst 30%)
+    """
     candidates = generate_candidate_actions(n_candidates, horizon, state)
 
-    best_cost = float('inf')
+    best_cvar = float('inf')
     best_m1_action = np.zeros(2)
     best_m2_action = np.zeros(2)
     best_components = {}
 
     for m1_actions, m2_actions in candidates:
-        trajectory = simulate_trajectory(state, m1_actions, m2_actions, dt)
+        scenario_costs = []
+        scenario_components = []
 
-        total_cost = 0.0
-        all_components = {}
+        for s in range(n_scenarios):
+            rng = np.random.RandomState(seed=None)  # fresh random state per scenario
+            trajectory = simulate_trajectory(state, m1_actions, m2_actions, dt, rng=rng)
+            cost, components = evaluate_trajectory(trajectory)
+            scenario_costs.append(cost)
+            scenario_components.append(components)
 
-        for sim_state in trajectory:
-            cost, components = compute_cost(sim_state)
-            total_cost += cost
-            for k, v in components.items():
-                all_components[k] = all_components.get(k, 0.0) + v
+        # CVaR: average of the worst alpha fraction of scenarios
+        scenario_costs_arr = np.array(scenario_costs)
+        sorted_indices = np.argsort(scenario_costs_arr)[::-1]  # worst first
+        n_tail = max(1, int(np.ceil(n_scenarios * cvar_alpha)))
+        tail_indices = sorted_indices[:n_tail]
+        cvar_cost = np.mean(scenario_costs_arr[tail_indices])
 
-        if total_cost < best_cost:
-            best_cost = total_cost
+        if cvar_cost < best_cvar:
+            best_cvar = cvar_cost
             best_m1_action = m1_actions[0]
             best_m2_action = m2_actions[0]
-            best_components = all_components
+            # Report components from the median scenario for interpretability
+            median_idx = sorted_indices[n_scenarios // 2]
+            best_components = scenario_components[median_idx]
 
     return best_m1_action, best_m2_action, best_components
 
