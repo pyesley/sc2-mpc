@@ -27,6 +27,43 @@ from cost_primitives import (
     medivac_safety, medivac_heal_proximity,
 )
 
+# ─────────────────────────────────────────────────────────────
+# Weight knobs — variants tune these via module attribute override.
+# Functions read these at call time, so subprocess-level overrides
+# (e.g. cost_bio_v1a.py setting cost_bio.W_DEAD_MARINE = 24.0) take
+# effect for the whole process without code duplication.
+# ─────────────────────────────────────────────────────────────
+W_ENEMY_HP = 14.0
+W_WIN_BONUS = -25.0
+
+W_SURV_M = 6.0           # marine HP loss
+W_SURV_MM = 8.0          # marauder HP loss
+W_SURV_MV = 10.0         # medivac HP loss
+W_DEAD_M = 8.0           # per-marine death
+W_DEAD_MM = 14.0         # per-marauder death
+W_DEAD_MV = 40.0         # per-medivac death
+W_WIPEOUT = 100.0        # all bio + medivac dead
+
+W_MATCHUP_M = 1.0        # multiplier on per-marine matchup primitive sum
+W_MATCHUP_MM = 1.0       # multiplier on per-marauder matchup primitive sum
+W_MEDIVAC_SAFETY = 1.0   # multiplier
+W_MEDIVAC_HEAL = 1.0     # multiplier
+
+W_FOCUS_FIRE = 2.5       # per attacker in range of weakest enemy (negated)
+W_STALKER_PRIORITY = 3.0 # per (stalker, distance over MARAUDER_RANGE)
+W_DPS_M = 2.0            # reward per stationary marine in range
+W_DPS_MM = 2.5           # reward per stationary marauder in range
+
+# Optional structural hooks — variants can plug in extra cost components
+# without rewriting the whole composer. Each callable returns dict[str,
+# float] (single-state) or dict[str, ndarray(N,)] (batched), summed
+# straight into the existing `components` map.
+EXTRA_COST_FN = None         # f(state) -> dict[str, float]
+EXTRA_COST_FN_BATCH = None   # f(traj_t, ctx) -> dict[str, ndarray(N,)]
+                              # called inside the per-timestep loop with
+                              # the per-timestep dict and a context dict
+                              # of useful precomputed arrays
+
 
 # ─────────────────────────────────────────────────────────────
 # Single-state form (spec / readable)
@@ -53,9 +90,9 @@ def compute_cost(state) -> Tuple[float, Dict[str, float]]:
     total_e_hp = float(z_hp.sum() + s_hp.sum())
     total_e_hp_max = state.n_zealots * ZEALOT_HP_MAX + state.n_stalkers * STALKER_HP_MAX
     if n_z + n_s == 0:
-        components['enemy_hp'] = -25.0           # win bonus
+        components['enemy_hp'] = W_WIN_BONUS
     else:
-        components['enemy_hp'] = 14.0 * (total_e_hp / total_e_hp_max)
+        components['enemy_hp'] = W_ENEMY_HP * (total_e_hp / total_e_hp_max)
 
     # ── 2. Survival (per-type weighted by unit value) ──
     m_hp_sum = float(np.sum(np.asarray(state.marine_hps) * m_alive))
@@ -63,15 +100,14 @@ def compute_cost(state) -> Tuple[float, Dict[str, float]]:
     mv_hp_sum = float(np.sum(np.asarray(state.medivac_hps) * mv_alive))
 
     survival = 0.0
-    survival += 6.0 * (1.0 - m_hp_sum / max(state.n_marines * MARINE_HP_MAX, 1e-6))
-    survival += 8.0 * (1.0 - mm_hp_sum / max(state.n_marauders * MARAUDER_HP_MAX, 1e-6))
-    survival += 10.0 * (1.0 - mv_hp_sum / max(state.n_medivacs * MEDIVAC_HP_MAX, 1e-6))
-    # Per-death penalty (medivac death is catastrophic)
-    survival += 8.0 * (state.n_marines - n_m)
-    survival += 14.0 * (state.n_marauders - n_mm)
-    survival += 40.0 * (state.n_medivacs - n_mv)
+    survival += W_SURV_M * (1.0 - m_hp_sum / max(state.n_marines * MARINE_HP_MAX, 1e-6))
+    survival += W_SURV_MM * (1.0 - mm_hp_sum / max(state.n_marauders * MARAUDER_HP_MAX, 1e-6))
+    survival += W_SURV_MV * (1.0 - mv_hp_sum / max(state.n_medivacs * MEDIVAC_HP_MAX, 1e-6))
+    survival += W_DEAD_M * (state.n_marines - n_m)
+    survival += W_DEAD_MM * (state.n_marauders - n_mm)
+    survival += W_DEAD_MV * (state.n_medivacs - n_mv)
     if n_m + n_mm == 0 and n_mv == 0:
-        survival += 100.0  # total wipeout
+        survival += W_WIPEOUT
     components['survival'] = survival
 
     # If combat is over, skip the spatial components
@@ -108,7 +144,7 @@ def compute_cost(state) -> Tuple[float, Dict[str, float]]:
                 matchup_m += float(engage_marine_vs_stalker(d_s))
             else:
                 matchup_m += float(kite_marine_vs_zealot(d_z))
-    components['matchup_marines'] = matchup_m
+    components['matchup_marines'] = W_MATCHUP_M * matchup_m
 
     # ── 4. Marauder matchup ──
     matchup_mm = 0.0
@@ -128,7 +164,7 @@ def compute_cost(state) -> Tuple[float, Dict[str, float]]:
                 matchup_mm += float(engage_marauder_vs_stalker(d_s))
             else:
                 matchup_mm += float(kite_marauder_vs_zealot(d_z))
-    components['matchup_marauders'] = matchup_mm
+    components['matchup_marauders'] = W_MATCHUP_MM * matchup_mm
 
     # ── 5. Medivac safety ──
     if n_mv > 0:
@@ -139,7 +175,7 @@ def compute_cost(state) -> Tuple[float, Dict[str, float]]:
         if n_s > 0:
             all_enemy_pos.extend(s_pos[j] for j in range(state.n_stalkers) if s_alive[j])
         d_min = float(min(np.linalg.norm(mv_pos[0] - p) for p in all_enemy_pos))
-        components['medivac_safety'] = float(medivac_safety(d_min))
+        components['medivac_safety'] = W_MEDIVAC_SAFETY * float(medivac_safety(d_min))
     else:
         components['medivac_safety'] = 0.0
 
@@ -160,7 +196,7 @@ def compute_cost(state) -> Tuple[float, Dict[str, float]]:
         d_inj = float(np.linalg.norm(mv_pos[0] - bio_pos[injured_idx]))
         # Only reward heal proximity if there's actually injury
         if max(bio_def) > 1.0:
-            components['medivac_heal'] = float(medivac_heal_proximity(d_inj))
+            components['medivac_heal'] = W_MEDIVAC_HEAL * float(medivac_heal_proximity(d_inj))
         else:
             components['medivac_heal'] = 0.0
     else:
@@ -187,7 +223,7 @@ def compute_cost(state) -> Tuple[float, Dict[str, float]]:
         for i in range(state.n_marauders):
             if mm_alive[i] and np.linalg.norm(mm_pos[i] - weakest_pos) <= MARAUDER_RANGE:
                 in_range += 1
-        components['focus_fire'] = -2.5 * in_range
+        components['focus_fire'] = -W_FOCUS_FIRE * in_range
     else:
         components['focus_fire'] = 0.0
 
@@ -205,7 +241,7 @@ def compute_cost(state) -> Tuple[float, Dict[str, float]]:
                 if mm_alive[i]:
                     min_d = min(min_d, np.linalg.norm(mm_pos[i] - s_pos[j]))
             if min_d > MARAUDER_RANGE:
-                sp_cost += 3.0 * (min_d - MARAUDER_RANGE)
+                sp_cost += W_STALKER_PRIORITY * (min_d - MARAUDER_RANGE)
         components['stalker_priority'] = sp_cost
     else:
         components['stalker_priority'] = 0.0
@@ -216,15 +252,20 @@ def compute_cost(state) -> Tuple[float, Dict[str, float]]:
         if m_alive[i] and state.marine_weapon_ready[i]:
             for p in enemy_pos_list:
                 if np.linalg.norm(m_pos[i] - p) <= MARINE_RANGE:
-                    dps -= 2.0
+                    dps -= W_DPS_M
                     break
     for i in range(state.n_marauders):
         if mm_alive[i] and state.marauder_weapon_ready[i]:
             for p in enemy_pos_list:
                 if np.linalg.norm(mm_pos[i] - p) <= MARAUDER_RANGE:
-                    dps -= 2.5
+                    dps -= W_DPS_MM
                     break
     components['dps_uptime'] = dps
+
+    # Optional structural extension (variants set EXTRA_COST_FN)
+    if EXTRA_COST_FN is not None:
+        for k, v in EXTRA_COST_FN(state).items():
+            components[k] = components.get(k, 0.0) + float(v)
 
     return sum(components.values()), components
 
@@ -292,8 +333,8 @@ def compute_cost_batch(traj, n_marines: int, n_marauders: int,
         # 1. Enemy HP drive
         e_hp_eff = (z_hp * z_alive).sum(axis=-1) + (s_hp * s_alive).sum(axis=-1)
         e_hp_max = n_zealots * ZEALOT_HP_MAX + n_stalkers * STALKER_HP_MAX
-        ehc = 14.0 * (e_hp_eff / e_hp_max)
-        ehc = np.where(n_e_alive == 0, -25.0, ehc)
+        ehc = W_ENEMY_HP * (e_hp_eff / e_hp_max)
+        ehc = np.where(n_e_alive == 0, W_WIN_BONUS, ehc)
         comps['enemy_hp'] += ehc
 
         # 2. Survival
@@ -301,15 +342,15 @@ def compute_cost_batch(traj, n_marines: int, n_marauders: int,
         mm_hp_sum = (mm_hp * mm_alive).sum(axis=-1)
         mv_hp_sum = (mv_hp * mv_alive).sum(axis=-1)
         sv = (
-            6.0 * (1.0 - m_hp_sum / max(n_marines * MARINE_HP_MAX, 1e-6))
-          + 8.0 * (1.0 - mm_hp_sum / max(n_marauders * MARAUDER_HP_MAX, 1e-6))
-          + 10.0 * (1.0 - mv_hp_sum / max(n_medivacs * MEDIVAC_HP_MAX, 1e-6))
-          + 8.0 * (n_marines - m_alive.sum(axis=-1))
-          + 14.0 * (n_marauders - mm_alive.sum(axis=-1))
-          + 40.0 * (n_medivacs - n_mv_alive)
+            W_SURV_M * (1.0 - m_hp_sum / max(n_marines * MARINE_HP_MAX, 1e-6))
+          + W_SURV_MM * (1.0 - mm_hp_sum / max(n_marauders * MARAUDER_HP_MAX, 1e-6))
+          + W_SURV_MV * (1.0 - mv_hp_sum / max(n_medivacs * MEDIVAC_HP_MAX, 1e-6))
+          + W_DEAD_M * (n_marines - m_alive.sum(axis=-1))
+          + W_DEAD_MM * (n_marauders - mm_alive.sum(axis=-1))
+          + W_DEAD_MV * (n_medivacs - n_mv_alive)
         )
         all_dead = (n_bio_alive == 0) & (n_mv_alive == 0)
-        sv = sv + np.where(all_dead, 100.0, 0.0)
+        sv = sv + np.where(all_dead, W_WIPEOUT, 0.0)
         comps['survival'] += sv
 
         # Distances (batched)
@@ -339,7 +380,7 @@ def compute_cost_batch(traj, n_marines: int, n_marauders: int,
         m_match = np.where(m_d_z < 2.5, kite_z_m,
                   np.where(n_s_alive_b, engage_s_m, kite_z_m))
         m_match = np.where(m_alive, m_match, 0.0)
-        m_match_total = m_match.sum(axis=-1)
+        m_match_total = W_MATCHUP_M * m_match.sum(axis=-1)
         comps['matchup_marines'] += np.where(active, m_match_total, 0.0)
 
         # 4. Marauder matchup
@@ -348,7 +389,8 @@ def compute_cost_batch(traj, n_marines: int, n_marauders: int,
         mm_match = np.where(mm_d_z < 2.5, kite_z_mm,
                    np.where(n_s_alive_b, engage_s_mm, kite_z_mm))
         mm_match = np.where(mm_alive, mm_match, 0.0)
-        comps['matchup_marauders'] += np.where(active, mm_match.sum(axis=-1), 0.0)
+        mm_match_total = W_MATCHUP_MM * mm_match.sum(axis=-1)
+        comps['matchup_marauders'] += np.where(active, mm_match_total, 0.0)
 
         # 5. Medivac safety
         # mv_pos (N, 1, 2), all enemies (N, n_e, 2)
@@ -360,7 +402,9 @@ def compute_cost_batch(traj, n_marines: int, n_marauders: int,
         mv_d_min = np.min(mv2e, axis=-1)                            # (N, n_mv)
         mv_safety_per = medivac_safety(mv_d_min)
         mv_safety_per = np.where(mv_alive, mv_safety_per, 0.0)
-        comps['medivac_safety'] += np.where(active, mv_safety_per.sum(axis=-1), 0.0)
+        comps['medivac_safety'] += np.where(active,
+                                             W_MEDIVAC_SAFETY * mv_safety_per.sum(axis=-1),
+                                             0.0)
 
         # 6. Medivac heal proximity (to most injured bio)
         # Need: per-batch, find most injured alive bio (marine or marauder)
@@ -384,7 +428,7 @@ def compute_cost_batch(traj, n_marines: int, n_marauders: int,
         any_injury = most_inj_dmg > 1.0
         heal_per = medivac_heal_proximity(d_mv_inj)
         heal_per = np.where(any_injury & mv_alive[:, 0], heal_per, 0.0)
-        comps['medivac_heal'] += np.where(active, heal_per, 0.0)
+        comps['medivac_heal'] += np.where(active, W_MEDIVAC_HEAL * heal_per, 0.0)
 
         # 7. Focus fire on lowest-HP alive enemy
         all_e_hp = np.concatenate([z_hp, s_hp], axis=-1)
@@ -398,7 +442,7 @@ def compute_cost_batch(traj, n_marines: int, n_marauders: int,
         m_in_range_of_w = (d_m_w <= MARINE_RANGE) & m_alive
         mm_in_range_of_w = (d_mm_w <= MARAUDER_RANGE) & mm_alive
         n_in_range = m_in_range_of_w.sum(axis=-1) + mm_in_range_of_w.sum(axis=-1)
-        ff = -2.5 * n_in_range
+        ff = -W_FOCUS_FIRE * n_in_range
         ff = np.where(weakest_alive, ff, 0.0)
         comps['focus_fire'] += np.where(active, ff, 0.0)
 
@@ -410,7 +454,7 @@ def compute_cost_batch(traj, n_marines: int, n_marauders: int,
         bio_to_s_eff = np.where(bio_alive[:, :, None], bio_to_s, np.inf)
         s_min_d = np.min(bio_to_s_eff, axis=1)                        # (N, n_s)
         sp_per = np.where(s_alive & (s_min_d > MARAUDER_RANGE),
-                          3.0 * (s_min_d - MARAUDER_RANGE), 0.0)
+                          W_STALKER_PRIORITY * (s_min_d - MARAUDER_RANGE), 0.0)
         comps['stalker_priority'] += np.where(active, sp_per.sum(axis=-1), 0.0)
 
         # 9. DPS uptime
@@ -419,11 +463,25 @@ def compute_cost_batch(traj, n_marines: int, n_marauders: int,
                           <= MARINE_RANGE)
         mm_in_range_any = (np.min(np.concatenate([mm2z_eff, mm2s_eff], axis=-1), axis=-1)
                            <= MARAUDER_RANGE)
-        m_dps = (m_alive & m_ready & m_in_range_any) * -2.0
-        mm_dps = (mm_alive & mm_ready & mm_in_range_any) * -2.5
+        m_dps = (m_alive & m_ready & m_in_range_any) * -W_DPS_M
+        mm_dps = (mm_alive & mm_ready & mm_in_range_any) * -W_DPS_MM
         comps['dps_uptime'] += np.where(active,
                                          m_dps.sum(axis=-1) + mm_dps.sum(axis=-1),
                                          0.0)
+
+        # Optional structural extension (variants set EXTRA_COST_FN_BATCH)
+        if EXTRA_COST_FN_BATCH is not None:
+            ctx = dict(
+                m_pos=m_pos, mm_pos=mm_pos, mv_pos=mv_pos,
+                z_pos=z_pos, s_pos=s_pos,
+                m_alive=m_alive, mm_alive=mm_alive,
+                z_alive=z_alive, s_alive=s_alive,
+                active=active, arange_N=np.arange(N),
+            )
+            for k, v in EXTRA_COST_FN_BATCH(ctx).items():
+                if k not in comps:
+                    comps[k] = np.zeros(N)
+                comps[k] += v
 
     err_ctx.__exit__(None, None, None)
     total = sum(comps.values())

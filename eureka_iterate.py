@@ -25,12 +25,12 @@ from typing import Dict, List
 import numpy as np
 
 
-SCENARIO = "scenario_circle.py"
+DEFAULT_SCENARIO = "scenario_circle.py"
 SC2PATH_DEFAULT = "/home/pyesley/StarCraftII"
 DEFAULT_GAMES_PER_VARIANT = 5
 
 
-def run_one(variant: str, game_id: int, sc2path: str, timeout: int) -> dict:
+def run_one(variant: str, game_id: int, scenario: str, sc2path: str, timeout: int) -> dict:
     """Run one game; subprocess uses the chosen cost variant via env."""
     env = os.environ.copy()
     env["SC2PATH"] = sc2path
@@ -43,7 +43,7 @@ def run_one(variant: str, game_id: int, sc2path: str, timeout: int) -> dict:
 
     t0 = time.time()
     proc = subprocess.run(
-        [sys.executable, SCENARIO],
+        [sys.executable, scenario],
         env=env, capture_output=True, text=True, timeout=timeout,
     )
     wall = time.time() - t0
@@ -154,9 +154,11 @@ def main():
     games = int(os.environ.get("GAMES_PER_VARIANT", str(DEFAULT_GAMES_PER_VARIANT)))
     timeout = int(os.environ.get("RUN_TIMEOUT", "600"))
     sc2path = os.environ.get("SC2PATH", SC2PATH_DEFAULT)
+    scenario = os.environ.get("SCENARIO", DEFAULT_SCENARIO)
     total = len(variants) * games
 
     print(f"Eureka iteration: {len(variants)} variants × {games} games = {total} games")
+    print(f"  Scenario : {scenario}")
     print(f"  Variants : {', '.join(variants)}")
     print(f"  SC2PATH  : {sc2path}")
     print(f"  Timeout  : {timeout}s/game")
@@ -168,7 +170,7 @@ def main():
         futures = {}
         for v in variants:
             for g in range(games):
-                fut = ex.submit(run_one, v, g, sc2path, timeout)
+                fut = ex.submit(run_one, v, g, scenario, sc2path, timeout)
                 futures[fut] = (v, g)
         for fut in as_completed(futures):
             v, g = futures[fut]
