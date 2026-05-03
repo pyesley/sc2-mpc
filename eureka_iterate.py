@@ -27,7 +27,8 @@ import numpy as np
 
 DEFAULT_SCENARIO = "scenario_circle.py"
 SC2PATH_DEFAULT = "/home/pyesley/StarCraftII"
-DEFAULT_GAMES_PER_VARIANT = 5
+DEFAULT_GAMES_PER_VARIANT = 30
+DEFAULT_MAX_PARALLEL = 20    # below CPU count to avoid SC2-process contention
 
 
 def run_one(variant: str, game_id: int, scenario: str, sc2path: str, timeout: int) -> dict:
@@ -155,18 +156,21 @@ def main():
     timeout = int(os.environ.get("RUN_TIMEOUT", "600"))
     sc2path = os.environ.get("SC2PATH", SC2PATH_DEFAULT)
     scenario = os.environ.get("SCENARIO", DEFAULT_SCENARIO)
+    max_parallel = int(os.environ.get("MAX_PARALLEL", str(DEFAULT_MAX_PARALLEL)))
     total = len(variants) * games
+    workers = min(total, max_parallel)
 
     print(f"Eureka iteration: {len(variants)} variants × {games} games = {total} games")
-    print(f"  Scenario : {scenario}")
-    print(f"  Variants : {', '.join(variants)}")
-    print(f"  SC2PATH  : {sc2path}")
-    print(f"  Timeout  : {timeout}s/game")
+    print(f"  Scenario       : {scenario}")
+    print(f"  Variants       : {', '.join(variants)}")
+    print(f"  Parallel cap   : {workers} concurrent (of {total} total)")
+    print(f"  SC2PATH        : {sc2path}")
+    print(f"  Timeout        : {timeout}s/game")
     print()
 
     t0 = time.time()
     results = []
-    with ProcessPoolExecutor(max_workers=total) as ex:
+    with ProcessPoolExecutor(max_workers=workers) as ex:
         futures = {}
         for v in variants:
             for g in range(games):

@@ -34,10 +34,25 @@ MARAUDER_RANGE = 6.0
 STALKER_RANGE = 6.0
 MEDIVAC_HEAL_RANGE = 4.0
 
-MARINE_DPS = 9.8
-MARAUDER_DPS = 9.3
-STALKER_DPS = 9.7
-ZEALOT_DPS = 26.3
+# Target-aware effective DPS (after armor reduction; +10 marauder bonus
+# vs armored stalker). All values from canonical SC2 unit data:
+#   damage / cooldown, with armor=1 on zealot/marauder/medivac/stalker,
+#   marine has 0 armor, +10 marauder vs ARMORED type.
+MARINE_DPS_VS_ZEALOT = (6.0 - 1.0) / 0.61      # 8.20 (zealot has 1 armor)
+MARINE_DPS_VS_STALKER = (6.0 - 1.0) / 0.61     # 8.20 (stalker has 1 armor)
+MARAUDER_DPS_VS_ZEALOT = (10.0 - 1.0) / 1.07   # 8.41 (no bonus vs light)
+MARAUDER_DPS_VS_STALKER = (20.0 - 1.0) / 1.07  # 17.76 (+10 vs armored)
+ZEALOT_DPS_VS_MARINE = (8.0 + 8.0) / 0.86      # 18.60 (twin blades, no armor)
+ZEALOT_DPS_VS_MARAUDER = (8.0 - 1.0 + 8.0 - 1.0) / 0.86   # 16.28
+STALKER_DPS_VS_MARINE = 13.0 / 1.34            # 9.70
+STALKER_DPS_VS_MARAUDER = (13.0 - 1.0) / 1.34  # 8.96
+
+# Legacy fixed-value aliases (for any external callers / cost docs).
+# Not used in damage application — kept to avoid breaking imports.
+MARINE_DPS = MARINE_DPS_VS_ZEALOT
+MARAUDER_DPS = MARAUDER_DPS_VS_STALKER     # bias toward the priority case
+STALKER_DPS = STALKER_DPS_VS_MARINE
+ZEALOT_DPS = ZEALOT_DPS_VS_MARINE
 
 MEDIVAC_HEAL_RATE = 9.0     # HP / s
 
@@ -441,12 +456,13 @@ def simulate_batch(state, actions, dt=0.4, stochastic=True):
         z_step = zdir * np.minimum(ZEALOT_SPEED * dt, zd[..., 0])[..., None]
         z_pos = z_pos + z_step * z_alive[..., None]
 
-        # Zealot melee damage (if in range 1.0)
+        # Zealot melee damage (target-aware: 18.6 DPS vs marine, 16.28 vs marauder)
         new_zd = np.linalg.norm(z_target_pos - z_pos, axis=-1)
         z_in_melee = (new_zd < 1.0) & z_alive
-        z_dmg = z_in_melee * ZEALOT_DPS * dt
-        # bio target index (N, n_z), scatter -damage onto bio HP
-        # bio HP = stacked [m_hp ; mm_hp] — we need to split back
+        z_target_is_marine = z_target < n_m                            # (N, n_z)
+        z_dps = np.where(z_target_is_marine,
+                         ZEALOT_DPS_VS_MARINE, ZEALOT_DPS_VS_MARAUDER)
+        z_dmg = z_in_melee * z_dps * dt
         bio_hp = np.concatenate([m_hp, mm_hp], axis=-1)
         z_b = np.broadcast_to(arange_N[:, None], (N, n_z))
         np.add.at(bio_hp, (z_b, z_target), -z_dmg)
@@ -467,7 +483,10 @@ def simulate_batch(state, actions, dt=0.4, stochastic=True):
         s_pos = s_pos + step * out_of_range[..., None]
         # Stalker shoots if in range
         s_in_range = (sd[..., 0] <= STALKER_RANGE) & s_alive
-        s_dmg = s_in_range * STALKER_DPS * dt
+        s_target_is_marine = s_target < n_m
+        s_dps = np.where(s_target_is_marine,
+                         STALKER_DPS_VS_MARINE, STALKER_DPS_VS_MARAUDER)
+        s_dmg = s_in_range * s_dps * dt
         s_b = np.broadcast_to(arange_N[:, None], (N, n_s))
         np.add.at(bio_hp, (s_b, s_target), -s_dmg)
         m_hp = bio_hp[:, :n_m]
@@ -484,21 +503,27 @@ def simulate_batch(state, actions, dt=0.4, stochastic=True):
         m_target = np.argmin(m2e_eff, axis=-1)
         m_target_d = np.min(m2e_eff, axis=-1)
         m_shoots = m_alive & ~m_moving & (m_target_d <= MARINE_RANGE)
-        m_dmg = m_shoots * MARINE_DPS * dt
-        # Damage scatter into combined enemy HP array
+        # m_target indexes into [zealots..., stalkers...]
+        m_target_is_zealot = m_target < n_z
+        m_dps = np.where(m_target_is_zealot,
+                         MARINE_DPS_VS_ZEALOT, MARINE_DPS_VS_STALKER)
+        m_dmg = m_shoots * m_dps * dt
         e_hp = np.concatenate([z_hp, s_hp], axis=-1)
         m_b = np.broadcast_to(arange_N[:, None], (N, n_m))
         np.add.at(e_hp, (m_b, m_target), -m_dmg)
         z_hp = e_hp[:, :n_z]
         s_hp = e_hp[:, n_z:]
 
-        # Marauders
+        # Marauders — +10 bonus vs armored stalker (huge difference)
         mm2e = np.linalg.norm(mm_pos[:, :, None, :] - all_e_pos[:, None, :, :], axis=-1)
         mm2e_eff = np.where(all_e_alive[:, None, :], mm2e, np.inf)
         mm_target = np.argmin(mm2e_eff, axis=-1)
         mm_target_d = np.min(mm2e_eff, axis=-1)
         mm_shoots = mm_alive & ~mm_moving & (mm_target_d <= MARAUDER_RANGE)
-        mm_dmg = mm_shoots * MARAUDER_DPS * dt
+        mm_target_is_zealot = mm_target < n_z
+        mm_dps = np.where(mm_target_is_zealot,
+                          MARAUDER_DPS_VS_ZEALOT, MARAUDER_DPS_VS_STALKER)
+        mm_dmg = mm_shoots * mm_dps * dt
         e_hp = np.concatenate([z_hp, s_hp], axis=-1)
         mm_b = np.broadcast_to(arange_N[:, None], (N, n_mm))
         np.add.at(e_hp, (mm_b, mm_target), -mm_dmg)
