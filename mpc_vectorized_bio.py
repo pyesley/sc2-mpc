@@ -288,14 +288,18 @@ def _sample_independent_actions(state, N_indep, horizon):
 
 def sample_actions_batch(state, N, horizon):
     """N candidate sequences, each committed to one of 5 team modes
-    for the whole horizon. Returns (N, n_total, horizon, 2)."""
+    for the whole horizon. Returns (N, n_total, horizon, 2).
+
+    MODE_PROBS may be either a length-5 array OR a callable taking
+    `state` and returning a length-5 array (for state-conditional
+    mode-mix variants like v3b)."""
     n_m = state.n_marines
     n_mm = state.n_marauders
     n_mv = state.n_medivacs
     n_total = n_m + n_mm + n_mv
 
-    # Pick mode per candidate
-    modes = np.random.choice(5, size=N, p=MODE_PROBS)
+    probs = MODE_PROBS(state) if callable(MODE_PROBS) else MODE_PROBS
+    modes = np.random.choice(5, size=N, p=probs)
 
     # Alive mask broadcast across (N, n_total)
     m_alive0 = np.asarray(state.marine_hps, dtype=np.float64) > 0
@@ -558,8 +562,22 @@ def simulate_batch(state, actions, dt=0.4, stochastic=True):
     }
 
 
-def mpc_select_action_vectorized(state, n_candidates=64, n_scenarios=4,
-                                  horizon=8, dt=0.4, cvar_alpha=0.3):
+# MPC defaults — overridable by variants via module attr (e.g.
+# mpc_vectorized_bio.MPC_HORIZON = 12).
+MPC_N_CANDIDATES = 64
+MPC_N_SCENARIOS = 4
+MPC_HORIZON = 8
+MPC_DT = 0.4
+MPC_CVAR_ALPHA = 0.3
+
+
+def mpc_select_action_vectorized(state, n_candidates=None, n_scenarios=None,
+                                  horizon=None, dt=None, cvar_alpha=None):
+    if n_candidates is None: n_candidates = MPC_N_CANDIDATES
+    if n_scenarios is None: n_scenarios = MPC_N_SCENARIOS
+    if horizon is None: horizon = MPC_HORIZON
+    if dt is None: dt = MPC_DT
+    if cvar_alpha is None: cvar_alpha = MPC_CVAR_ALPHA
     """Returns (actions_list, components) where actions_list is one
     np.ndarray(2) per controlled unit in order [marines..., marauders..., medivac]."""
     n_m = state.n_marines

@@ -88,6 +88,7 @@ class BotBio(BotAI):
         self.total_components: Dict[str, float] = {}
         self.game_over = False
         self.visualize = visualize
+        self.vis = None
 
     async def on_step(self, iteration: int):
         if self.game_over:
@@ -224,6 +225,12 @@ class BotBio(BotAI):
                 elif priority is not None:
                     u.attack(priority)
 
+        if self.visualize and self.step_count % 2 == 0:
+            if self.vis is None:
+                from visualizer_bio import BioVisualizer
+                self.vis = BioVisualizer()
+            self.vis.update(state, self.step_count, self.time)
+
         if self.step_count % 20 == 0:
             ehp = sum(u.health + u.shield for u in live_enemies)
             mhp = sum(u.health for u in marines + marauders if u is not None)
@@ -276,6 +283,8 @@ class BotBio(BotAI):
         for k, v in sorted(self.total_components.items()):
             print(f"  {k:30s}: {v:10.2f}")
         print(f"{'='*60}\n")
+        if self.vis:
+            self.vis.show_result(result, reason)
 
     async def on_end(self, game_result):
         pass
