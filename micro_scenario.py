@@ -336,7 +336,7 @@ def mpc_select_action(state, n_candidates=96, n_scenarios=8, horizon=8,
 class MicroBot(BotAI):
     """Role-free 2v1 micro controller."""
 
-    def __init__(self, visualize=False, use_qp=False):
+    def __init__(self, visualize=False, use_qp=False, use_fast=False):
         super().__init__()
         self.scenario_started = False
         self.setup_done = False
@@ -348,6 +348,7 @@ class MicroBot(BotAI):
         self.game_over = False
         self.visualize = visualize
         self.use_qp = use_qp
+        self.use_fast = use_fast
         self.vis = None
 
     async def on_step(self, iteration: int):
@@ -421,6 +422,9 @@ class MicroBot(BotAI):
         if self.use_qp:
             from qp_controller import mpc_select_action_qp
             m1_action, m2_action, cost_components = mpc_select_action_qp(state)
+        elif self.use_fast:
+            from mpc_vectorized import mpc_select_action_vectorized
+            m1_action, m2_action, cost_components = mpc_select_action_vectorized(state)
         else:
             m1_action, m2_action, cost_components = mpc_select_action(state)
 
@@ -543,14 +547,17 @@ class MicroBot(BotAI):
 def main():
     visualize = '--vis' in sys.argv
     use_qp = '--qp' in sys.argv
+    use_fast = '--fast' in sys.argv
     if use_qp:
         print("Using QP-based SMPC (OSQP)")
+    elif use_fast:
+        print("Using vectorized SMPC (numpy batch)")
     else:
         print("Using sampling-based SMPC (CVaR)")
     run_game(
         maps.get("Flat32"),
         [
-            Bot(Race.Protoss, MicroBot(visualize=visualize, use_qp=use_qp)),
+            Bot(Race.Protoss, MicroBot(visualize=visualize, use_qp=use_qp, use_fast=use_fast)),
             Computer(Race.Protoss, Difficulty.VeryEasy),
         ],
         realtime=False,
