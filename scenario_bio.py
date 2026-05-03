@@ -247,20 +247,21 @@ class BotBio(BotAI):
             await self.client.debug_kill_unit(self.enemy_units)
 
         c = MAP_CENTER
-        # Bio army on the left in a small formation
+        # Bio army on the left, further back to give time for the
+        # formation to set up before contact (was c.x-8, now c.x-14).
         for i in range(N_MARINES):
-            dx = -8 + (i % 3) * 1.2
+            dx = -14 + (i % 3) * 1.2
             dy = -2 + (i // 3) * 1.5
             await self.client.debug_create_unit([
                 [UnitTypeId.MARINE, 1, Point2((c.x + dx, c.y + dy)), 1],
             ])
         for i in range(N_MARAUDERS):
             await self.client.debug_create_unit([
-                [UnitTypeId.MARAUDER, 1, Point2((c.x - 7, c.y + (-1 + 2*i))), 1],
+                [UnitTypeId.MARAUDER, 1, Point2((c.x - 13, c.y + (-1 + 2*i))), 1],
             ])
         for i in range(N_MEDIVACS):
             await self.client.debug_create_unit([
-                [UnitTypeId.MEDIVAC, 1, Point2((c.x - 9, c.y)), 1],
+                [UnitTypeId.MEDIVAC, 1, Point2((c.x - 15, c.y)), 1],
             ])
         # Protoss army on the right
         for i in range(N_ZEALOTS):

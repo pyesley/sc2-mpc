@@ -53,6 +53,11 @@ W_FOCUS_FIRE = 2.5       # per attacker in range of weakest enemy (negated)
 W_STALKER_PRIORITY = 3.0 # per (stalker, distance over MARAUDER_RANGE)
 W_DPS_M = 2.0            # reward per stationary marine in range
 W_DPS_MM = 2.5           # reward per stationary marauder in range
+W_COHESION = 0.0         # per (max-pairwise-bio-distance - COHESION_THRESHOLD).
+                          # Default 0 (off). Variants set this to penalize
+                          # bio army getting split (the "divide and conquer"
+                          # failure mode where enemy peels off a unit).
+COHESION_THRESHOLD = 6.0 # bio max pairwise dist allowed before cohesion penalty
 
 # Optional structural hooks — variants can plug in extra cost components
 # without rewriting the whole composer. Each callable returns dict[str,
@@ -262,6 +267,19 @@ def compute_cost(state) -> Tuple[float, Dict[str, float]]:
                     break
     components['dps_uptime'] = dps
 
+    # ── 10. Army cohesion (anti-split). Penalize stragglers. ──
+    coh = 0.0
+    if W_COHESION > 0.0:
+        bio_pos_alive = [p for i, p in enumerate(state.marine_positions) if m_alive[i]]
+        bio_pos_alive += [p for i, p in enumerate(state.marauder_positions) if mm_alive[i]]
+        if len(bio_pos_alive) >= 2:
+            arr = np.asarray(bio_pos_alive)
+            d = np.linalg.norm(arr[:, None, :] - arr[None, :, :], axis=-1)
+            max_pair = float(d.max())
+            if max_pair > COHESION_THRESHOLD:
+                coh = W_COHESION * (max_pair - COHESION_THRESHOLD)
+    components['cohesion'] = coh
+
     # Optional structural extension (variants set EXTRA_COST_FN)
     if EXTRA_COST_FN is not None:
         for k, v in EXTRA_COST_FN(state).items():
@@ -468,6 +486,22 @@ def compute_cost_batch(traj, n_marines: int, n_marauders: int,
         comps['dps_uptime'] += np.where(active,
                                          m_dps.sum(axis=-1) + mm_dps.sum(axis=-1),
                                          0.0)
+
+        # Cohesion (anti-split). Max pairwise dist between alive bio.
+        if W_COHESION > 0.0:
+            bio_pos_t = np.concatenate([m_pos, mm_pos], axis=1)             # (N, n_bio, 2)
+            bio_alive_t = np.concatenate([m_alive, mm_alive], axis=-1)
+            d_pair = np.linalg.norm(bio_pos_t[:, :, None, :]
+                                     - bio_pos_t[:, None, :, :], axis=-1)
+            both_alive = bio_alive_t[:, :, None] & bio_alive_t[:, None, :]
+            d_pair = np.where(both_alive, d_pair, -np.inf)
+            max_pair = np.max(d_pair, axis=(1, 2))                          # (N,)
+            n_alive_bio = bio_alive_t.sum(axis=-1)
+            coh = np.where(n_alive_bio >= 2,
+                           W_COHESION * np.maximum(0.0, max_pair - COHESION_THRESHOLD),
+                           0.0)
+            comps.setdefault('cohesion', np.zeros(N))
+            comps['cohesion'] += np.where(active, coh, 0.0)
 
         # Optional structural extension (variants set EXTRA_COST_FN_BATCH)
         if EXTRA_COST_FN_BATCH is not None:
