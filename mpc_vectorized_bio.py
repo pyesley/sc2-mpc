@@ -111,10 +111,99 @@ MARAUDER_WEIGHTS = [
 ]
 
 
-def sample_actions_batch(state, N, horizon):
-    """Sample N candidate action sequences for all controlled units.
-    Returns (N, n_total_units, horizon, 2) where the unit ordering is
-    [marines..., marauders..., medivac]."""
+# ─── Team-mode templates ─────────────────────────────────────
+# Mode IDs:
+#   0  INDEPENDENT  per-unit kite/engage (original behavior)
+#   1  RETREAT      all units away from enemy centroid
+#   2  FOCUS_FIRE   bio toward weakest-HP enemy, medivac toward bio
+#   3  SHIELD       marauders forward (toward enemy centroid),
+#                    marines toward marauder centroid (behind),
+#                    medivac with marauders
+#   4  HOLD         all stop (zero direction)
+MODE_INDEPENDENT, MODE_RETREAT, MODE_FOCUS_FIRE, MODE_SHIELD, MODE_HOLD = 0, 1, 2, 3, 4
+MODE_PROBS = np.array([0.30, 0.18, 0.20, 0.18, 0.14])  # sums to 1
+
+
+def _team_direction_templates(state):
+    """Compute per-unit (n_total, 2) direction templates for each non-
+    independent team mode. These are constant across the horizon for a
+    given candidate (the candidate commits to a team intent for the
+    whole planning window)."""
+    n_m = state.n_marines
+    n_mm = state.n_marauders
+    n_mv = state.n_medivacs
+    n_total = n_m + n_mm + n_mv
+
+    m_pos = np.asarray(state.marine_positions, dtype=np.float64)
+    mm_pos = np.asarray(state.marauder_positions, dtype=np.float64)
+    mv_pos = np.asarray(state.medivac_positions, dtype=np.float64)
+    z_pos = np.asarray(state.zealot_positions, dtype=np.float64)
+    s_pos = np.asarray(state.stalker_positions, dtype=np.float64)
+    z_alive = np.asarray(state.zealot_alive, dtype=bool)
+    s_alive = np.asarray(state.stalker_alive, dtype=bool)
+    z_hp = np.asarray(state.zealot_hps, dtype=np.float64)
+    s_hp = np.asarray(state.stalker_hps, dtype=np.float64)
+    m_alive = np.asarray(state.marine_hps, dtype=np.float64) > 0
+    mm_alive = np.asarray(state.marauder_hps, dtype=np.float64) > 0
+
+    all_unit_pos = np.concatenate([m_pos, mm_pos, mv_pos], axis=0)   # (n_total, 2)
+
+    # Bio centroid (alive only; fall back to all)
+    alive_bio_pos = np.concatenate([m_pos[m_alive], mm_pos[mm_alive]], axis=0)
+    if len(alive_bio_pos):
+        bio_centroid = alive_bio_pos.mean(axis=0)
+    else:
+        bio_centroid = mv_pos[0] if n_mv > 0 else m_pos[0]
+
+    # Marauder centroid (alive only; fall back to bio centroid)
+    alive_mm = mm_pos[mm_alive] if mm_alive.any() else None
+    marauder_centroid = alive_mm.mean(axis=0) if alive_mm is not None else bio_centroid
+
+    # Enemy centroid + weakest enemy
+    all_e_pos = np.concatenate([z_pos, s_pos], axis=0)
+    all_e_alive = np.concatenate([z_alive, s_alive], axis=0)
+    all_e_hp = np.concatenate([z_hp, s_hp], axis=0)
+    if all_e_alive.any():
+        enemy_centroid = all_e_pos[all_e_alive].mean(axis=0)
+        e_hp_masked = np.where(all_e_alive, all_e_hp, np.inf)
+        weakest_pos = all_e_pos[int(np.argmin(e_hp_masked))]
+    else:
+        # No enemies — pick a default far-away point so retreat directions are sensible
+        enemy_centroid = bio_centroid + np.array([60.0, 0.0])
+        weakest_pos = enemy_centroid
+
+    def _normalize(v):
+        n = np.linalg.norm(v, axis=-1, keepdims=True)
+        return np.where(n > 0.1, v / np.maximum(n, 1e-6), 0.0)
+
+    # Mode 1 RETREAT: away from enemy centroid
+    retreat = _normalize(all_unit_pos - enemy_centroid[None, :])
+
+    # Mode 2 FOCUS_FIRE: bio toward weakest enemy, medivac toward bio centroid
+    focus = _normalize(weakest_pos[None, :] - all_unit_pos)
+    if n_mv > 0:
+        focus[n_m + n_mm:] = _normalize(bio_centroid[None, :] - mv_pos)
+
+    # Mode 3 SHIELD: marauders → enemy centroid; marines → marauder centroid;
+    # medivac → marauder centroid
+    shield = np.zeros((n_total, 2))
+    if n_m > 0:
+        shield[:n_m] = _normalize(marauder_centroid[None, :] - m_pos)
+    if n_mm > 0:
+        shield[n_m:n_m + n_mm] = _normalize(enemy_centroid[None, :] - mm_pos)
+    if n_mv > 0:
+        shield[n_m + n_mm:] = _normalize(marauder_centroid[None, :] - mv_pos)
+
+    # Mode 4 HOLD: zero
+    hold = np.zeros((n_total, 2))
+
+    return {MODE_RETREAT: retreat, MODE_FOCUS_FIRE: focus,
+            MODE_SHIELD: shield, MODE_HOLD: hold}
+
+
+def _sample_independent_actions(state, N_indep, horizon):
+    """Original per-unit independent-kite sampler. Used for the
+    INDEPENDENT mode subset of candidates."""
     n_m = state.n_marines
     n_mm = state.n_marauders
     n_mv = state.n_medivacs
@@ -131,8 +220,7 @@ def sample_actions_batch(state, N, horizon):
     mm_alive0 = np.asarray(state.marauder_hps, dtype=np.float64) > 0
     mv_alive0 = np.asarray(state.medivac_hps, dtype=np.float64) > 0
 
-    # Closest enemy per marine / marauder (zealot or stalker)
-    all_enemy_pos = np.concatenate([z_pos0, s_pos0], axis=0)             # (n_z+n_s, 2)
+    all_enemy_pos = np.concatenate([z_pos0, s_pos0], axis=0)
     all_enemy_alive = np.concatenate([z_alive0, s_alive0], axis=0)
 
     def _closest(my_pos):
@@ -144,24 +232,19 @@ def sample_actions_batch(state, N, horizon):
     m_d_threat, m_threat_pos = _closest(m_pos0)
     mm_d_threat, mm_threat_pos = _closest(mm_pos0)
 
-    # Broadcast initial state into (N, n, ...)
-    m_pos_b = np.broadcast_to(m_pos0[None], (N, n_m, 2))
-    mm_pos_b = np.broadcast_to(mm_pos0[None], (N, n_mm, 2))
-    m_threat_b = np.broadcast_to(m_threat_pos[None], (N, n_m, 2))
-    mm_threat_b = np.broadcast_to(mm_threat_pos[None], (N, n_mm, 2))
-    m_d_b = np.broadcast_to(m_d_threat[None], (N, n_m))
-    mm_d_b = np.broadcast_to(mm_d_threat[None], (N, n_mm))
-    m_alive_b = np.broadcast_to(m_alive0[None], (N, n_m))
-    mm_alive_b = np.broadcast_to(mm_alive0[None], (N, n_mm))
-    mv_alive_b = np.broadcast_to(mv_alive0[None], (N, n_mv))
+    m_pos_b = np.broadcast_to(m_pos0[None], (N_indep, n_m, 2))
+    mm_pos_b = np.broadcast_to(mm_pos0[None], (N_indep, n_mm, 2))
+    m_threat_b = np.broadcast_to(m_threat_pos[None], (N_indep, n_m, 2))
+    mm_threat_b = np.broadcast_to(mm_threat_pos[None], (N_indep, n_mm, 2))
+    m_d_b = np.broadcast_to(m_d_threat[None], (N_indep, n_m))
+    mm_d_b = np.broadcast_to(mm_d_threat[None], (N_indep, n_mm))
+    m_alive_b = np.broadcast_to(m_alive0[None], (N_indep, n_m))
+    mm_alive_b = np.broadcast_to(mm_alive0[None], (N_indep, n_mm))
+    mv_alive_b = np.broadcast_to(mv_alive0[None], (N_indep, n_mv))
 
-    # Medivac: needs target position = injured bio centroid (or just bio centroid)
-    # For sampling we approximate: medivac biases toward bio centroid, away from stalkers
-    bio_pos_init = np.concatenate([m_pos0[m_alive0], mm_pos0[mm_alive0]], axis=0) \
-                   if (m_alive0.any() or mm_alive0.any()) \
-                   else m_pos0[:1]
-    bio_centroid = bio_pos_init.mean(axis=0) if len(bio_pos_init) > 0 else mv_pos0[0]
-    # Closest stalker to medivac
+    # Medivac biases (independent mode)
+    alive_bio_pos = np.concatenate([m_pos0[m_alive0], mm_pos0[mm_alive0]], axis=0)
+    bio_centroid = alive_bio_pos.mean(axis=0) if len(alive_bio_pos) else mv_pos0[0]
     if s_alive0.any():
         d_mv_s = np.linalg.norm(mv_pos0[0] - s_pos0[s_alive0], axis=-1)
         nearest_stalker = s_pos0[s_alive0][int(np.argmin(d_mv_s))]
@@ -171,51 +254,84 @@ def sample_actions_batch(state, N, horizon):
         mv_threat_pos_init = mv_pos0[0] + np.array([100.0, 0.0])
         mv_d_threat_init = 100.0
 
-    actions = np.zeros((N, n_total, horizon, 2), dtype=np.float64)
-
+    actions = np.zeros((N_indep, n_total, horizon, 2), dtype=np.float64)
     for h in range(horizon):
-        # Marines: kite-based on closest enemy
-        m_dirs = _sample_kiting_unit(N, n_m, m_alive_b, m_pos_b, m_threat_b,
+        m_dirs = _sample_kiting_unit(N_indep, n_m, m_alive_b, m_pos_b, m_threat_b,
                                        m_d_b, [1.8, 3.5, 5.0, 7.0], MARINE_WEIGHTS)
-        # Marauders
-        mm_dirs = _sample_kiting_unit(N, n_mm, mm_alive_b, mm_pos_b, mm_threat_b,
+        mm_dirs = _sample_kiting_unit(N_indep, n_mm, mm_alive_b, mm_pos_b, mm_threat_b,
                                         mm_d_b, [2.0, 4.0, 6.0, 8.0], MARAUDER_WEIGHTS)
-        # Medivac: bias toward bio centroid, away from nearest stalker
-        # Simple sampler: 60% noise around centroid direction, 40% retreat from stalker
-        mv_dirs = np.zeros((N, n_mv, 2))
+        # Medivac per-step blend
         to_centroid = bio_centroid - mv_pos0[0]
         d_centroid = np.linalg.norm(to_centroid)
-        if d_centroid > 0.1:
-            to_centroid_n = to_centroid / d_centroid
-        else:
-            to_centroid_n = np.array([0.0, 0.0])
+        to_centroid_n = to_centroid / d_centroid if d_centroid > 0.1 else np.zeros(2)
         away_stalker = mv_pos0[0] - mv_threat_pos_init
         d_aws = np.linalg.norm(away_stalker)
-        if d_aws > 0.1:
-            away_stalker_n = away_stalker / d_aws
-        else:
-            away_stalker_n = np.array([1.0, 0.0])
-        # Per candidate weighted blend
-        u_blend = np.random.uniform(0.0, 1.0, N)
+        away_stalker_n = away_stalker / d_aws if d_aws > 0.1 else np.array([1.0, 0.0])
         if mv_d_threat_init < STALKER_RANGE + 1.0:
-            # In stalker threat range — heavy retreat bias
-            w_retreat = np.random.uniform(0.5, 1.0, N)
-            w_centroid = np.random.uniform(-0.2, 0.4, N)
+            w_retreat = np.random.uniform(0.5, 1.0, N_indep)
+            w_centroid = np.random.uniform(-0.2, 0.4, N_indep)
         else:
-            w_retreat = np.random.uniform(-0.2, 0.3, N)
-            w_centroid = np.random.uniform(0.4, 1.0, N)
+            w_retreat = np.random.uniform(-0.2, 0.3, N_indep)
+            w_centroid = np.random.uniform(0.4, 1.0, N_indep)
         mv_d = (w_retreat[:, None] * away_stalker_n[None, :]
                 + w_centroid[:, None] * to_centroid_n[None, :]
-                + 0.1 * np.random.randn(N, 2))
+                + 0.1 * np.random.randn(N_indep, 2))
         mv_norms = np.linalg.norm(mv_d, axis=-1, keepdims=True)
         mv_d = np.where(mv_norms > 0.1, mv_d / np.maximum(mv_norms, 1e-6), 0.0)
-        mv_d = np.where(mv_alive_b[:, 0:1, None], mv_d[:, None, :], 0.0)
-        mv_dirs = mv_d.reshape(N, n_mv, 2) if mv_d.ndim == 3 and mv_d.shape[1] == 1 else mv_d
+        mv_dirs = mv_d.reshape(N_indep, 1, 2) * mv_alive_b[:, :, None].astype(float)
 
-        # Pack into combined actions tensor [marines..., marauders..., medivac]
         actions[:, :n_m, h, :] = m_dirs
         actions[:, n_m:n_m + n_mm, h, :] = mm_dirs
         actions[:, n_m + n_mm:, h, :] = mv_dirs
+    return actions
+
+
+def sample_actions_batch(state, N, horizon):
+    """N candidate sequences, each committed to one of 5 team modes
+    for the whole horizon. Returns (N, n_total, horizon, 2)."""
+    n_m = state.n_marines
+    n_mm = state.n_marauders
+    n_mv = state.n_medivacs
+    n_total = n_m + n_mm + n_mv
+
+    # Pick mode per candidate
+    modes = np.random.choice(5, size=N, p=MODE_PROBS)
+
+    # Alive mask broadcast across (N, n_total)
+    m_alive0 = np.asarray(state.marine_hps, dtype=np.float64) > 0
+    mm_alive0 = np.asarray(state.marauder_hps, dtype=np.float64) > 0
+    mv_alive0 = np.asarray(state.medivac_hps, dtype=np.float64) > 0
+    unit_alive = np.concatenate([m_alive0, mm_alive0, mv_alive0])    # (n_total,)
+    unit_alive_b = np.broadcast_to(unit_alive[None], (N, n_total))   # (N, n_total)
+
+    actions = np.zeros((N, n_total, horizon, 2), dtype=np.float64)
+
+    # ── INDEPENDENT subset (mode 0) ──
+    idx_indep = np.where(modes == MODE_INDEPENDENT)[0]
+    if len(idx_indep) > 0:
+        actions[idx_indep] = _sample_independent_actions(state, len(idx_indep), horizon)
+
+    # ── Team-mode subsets ──
+    templates = _team_direction_templates(state)
+    for mode_id in (MODE_RETREAT, MODE_FOCUS_FIRE, MODE_SHIELD, MODE_HOLD):
+        idx_mode = np.where(modes == mode_id)[0]
+        if len(idx_mode) == 0:
+            continue
+        n_in = len(idx_mode)
+        base = templates[mode_id]                   # (n_total, 2)
+        if mode_id == MODE_HOLD:
+            # Pure stop, no noise
+            mode_actions = np.zeros((n_in, n_total, horizon, 2))
+        else:
+            # Repeat across horizon with small per-step noise, then
+            # re-normalize and zero-out dead units
+            noise = 0.10 * np.random.randn(n_in, n_total, horizon, 2)
+            ma = base[None, :, None, :] + noise
+            norms = np.linalg.norm(ma, axis=-1, keepdims=True)
+            ma = np.where(norms > 0.1, ma / np.maximum(norms, 1e-6), 0.0)
+            ma = ma * unit_alive[None, :, None, None]
+            mode_actions = ma
+        actions[idx_mode] = mode_actions
 
     return actions
 
